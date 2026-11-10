@@ -1,0 +1,300 @@
+"""Read-only verification cell for the Illinois Cost Containment notebook.
+
+Creates no tables and writes no files. Paste it into ONE notebook cell, run it, and send the full
+output. Each section runs on its own, so one error does not stop the others.
+"""
+
+import re
+
+import pandas as pd
+from pyspark.sql import functions as F
+
+# ---- Settings (same values as the Illinois notebook) ------------------------
+POLICY_SCHEMA = "ODS_STATS_TBLS_LH"
+CLAIMS_MONTHLY_TABLE = "DMAnalytics.FactClaimsMonthlyDataStore"
+CLAIM_COMPANY_CODE = "14044"
+POLICY_LOB_CODE = "AC"
+YEAR = 2025
+CLASS_WORKBOOK_PATH = "/lakehouse/default/Files/Commercial Auto Classes.xlsx"
+CLASS_SHEETS = [("Public Auto", 0, 4), ("Primary Class", 1, 3)]  # (sheet, header row, prefix length)
+SAMPLES_PER_TYPE = 2   # Sample policies shown per transaction type.
+ROWS = 25              # Maximum rows printed per table.
+HINT_PATTERN = (
+    r"(?i)premium|dividend|install|fee|surcharge|salvage|subro|recover|reinsur|ceded|net|gross"
+    r"|alae|expense|reserve|adjust|state|garag|zip"
+)
+
+
+def section(title: str) -> None:
+    """Print a section header."""
+    print("\n" + "=" * 72 + "\n" + title + "\n" + "=" * 72)
+
+
+def safe(title: str, function) -> None:
+    """Run one section and print its error instead of stopping the whole cell.
+
+    Args:
+        title: Section title.
+        function: Function that prints the section result.
+    """
+    section(title)
+    try:
+        function()
+    except Exception as error:  # noqa: BLE001 - the cell must continue with the next section.
+        print("[ERROR] " + str(error).strip().splitlines()[0][:300])
+
+
+def show(df, rows: int = ROWS) -> None:
+    """Print a DataFrame without truncating values."""
+    df.show(rows, truncate=False)
+
+
+# ---- Source tables and the premium rows used by most sections ---------------
+pdi = spark.table("%s.policy_policy_detail_info" % POLICY_SCHEMA)
+pi = spark.table("%s.policy_Product_info" % POLICY_SCHEMA)
+ri = spark.table("%s.policy_risk_item_info" % POLICY_SCHEMA)
+ci = spark.table("%s.policy_coverage_info" % POLICY_SCHEMA)
+monthly = spark.table(CLAIMS_MONTHLY_TABLE)
+
+detail_columns = [
+    "PolicyNumber", "PolicyVersion", "ReferencePolicyVersion", "PolicySource", "BookDate",
+    "ProrataPercent", "PrimaryRiskState", "InTransactionId",
+] + [
+    name for name in (
+        "EffectiveDate", "ExpirationDate", "TermEffectiveDate", "TermExpirationDate",
+        "PolicyInceptionDate", "FullTermAmount", "CurrentTermAmount",
+    ) if name in pdi.columns
+]
+onset = F.coalesce(F.col("c.OnsetAmount").cast("double"), F.lit(0.0))
+offset = F.coalesce(F.col("c.OffsetAmount").cast("double"), F.lit(0.0))
+premium_rows = (
+    pdi.alias("d")
+    .join(
+        pi.alias("p"),
+        (F.col("d.InTransactionId") == F.col("p.InTransactionId"))
+        & (F.col("p.LOBCode") == POLICY_LOB_CODE) & F.col("p.ParentProductID").isNull(),
+    )
+    .join(ci.alias("c"), F.col("d.InTransactionId") == F.col("c.InTransactionId"))
+    .filter((onset != 0) | (offset != 0))
+    .filter(F.year(F.col("d.BookDate")).between(YEAR - 1, YEAR) | F.col("d.BookDate").isNull())
+    .select(
+        *[F.col("d." + name) for name in detail_columns],
+        F.col("c.RiskItemId").alias("RiskItemId"),
+        F.col("c.CoverageCode").alias("CoverageCode"),
+        F.col("c.ASLOB").alias("ASLOB"),
+        F.col("c.OnsetAmount").alias("OnsetAmount"),
+        F.col("c.OffsetAmount").alias("OffsetAmount"),
+        F.when(onset != 0, onset).otherwise(offset).alias("premium"),
+    )
+    .cache()
+)
+versions = premium_rows.dropDuplicates(["PolicyNumber", "PolicyVersion"])
+written_flag = F.col("BookDate").isNull() | (F.year(F.col("BookDate")) == YEAR)
+
+
+def d(name: str):
+    """Return a column cast to date."""
+    return F.col(name).cast("date")
+
+
+# ---- Section 1: column hints --------------------------------------------------
+def columns_hints() -> None:
+    """List columns whose names hint at premium type, net or gross amounts, ALAE, reserve, state or zip."""
+    for name, df in [
+        ("policy_policy_detail_info", pdi), ("policy_coverage_info", ci),
+        ("policy_risk_item_info", ri), ("FactClaimsMonthlyDataStore", monthly),
+    ]:
+        print("%s (%d columns): %s" % (name, len(df.columns), [c for c in df.columns if re.search(HINT_PATTERN, c)]))
+    print("policy_policy_detail_info date and amount columns:",
+          [(f.name, str(f.dataType)) for f in pdi.schema.fields if re.search(r"(?i)date|amount|prorata", f.name)])
+
+
+# ---- Section 2: missing dates ------------------------------------------------
+def date_nulls() -> None:
+    """Count premium rows with a missing date column."""
+    names = [c for c in ("BookDate", "EffectiveDate", "ExpirationDate", "TermEffectiveDate", "TermExpirationDate")
+             if c in premium_rows.columns]
+    show(premium_rows.agg(
+        F.count(F.lit(1)).alias("premium_rows"),
+        *[F.sum(F.when(F.col(c).isNull(), 1).otherwise(0)).alias("null_" + c) for c in names],
+    ))
+
+
+# ---- Section 3: how the date columns relate -----------------------------------
+def date_relations() -> None:
+    """Show how transaction dates relate to term dates, and what ProrataPercent means."""
+    needed = ["EffectiveDate", "ExpirationDate", "TermEffectiveDate", "TermExpirationDate"]
+    missing = [c for c in needed if c not in versions.columns]
+    if missing:
+        print("Columns missing, section skipped:", missing)
+        return
+    start_vs_term = F.when(d("EffectiveDate") == d("TermEffectiveDate"), "same").otherwise("different")
+    end_vs_term = F.when(d("ExpirationDate") == d("TermExpirationDate"), "same").otherwise("different")
+    show(versions.groupBy(
+        "PolicySource", start_vs_term.alias("EffectiveDate_vs_TermEffectiveDate"),
+        end_vs_term.alias("ExpirationDate_vs_TermExpirationDate"),
+    ).count().orderBy("PolicySource", F.desc("count")))
+    fraction = F.datediff(d("ExpirationDate"), d("EffectiveDate")) / F.datediff(d("TermExpirationDate"), d("TermEffectiveDate"))
+    prorata = F.col("ProrataPercent").cast("double")
+    meaning = (
+        F.when(prorata.isNull(), "ProrataPercent is null")
+        .when(F.abs(prorata - 1) < 0.001, "ProrataPercent = 1")
+        .when(F.abs(prorata - fraction) < 0.02, "ProrataPercent = transaction period / term")
+        .otherwise("other")
+    )
+    show(versions.groupBy("PolicySource", meaning.alias("ProrataPercent_meaning")).count().orderBy("PolicySource", F.desc("count")))
+
+
+# ---- Section 4: sample policies by transaction type ----------------------------
+def sample_policies() -> None:
+    """Show every version of a few sample policies with dates, prorata and premium."""
+    needed = ["EffectiveDate", "ExpirationDate", "TermEffectiveDate", "TermExpirationDate"]
+    if [c for c in needed if c not in versions.columns]:
+        print("Date columns missing, section skipped.")
+        return
+    kinds = {
+        "period equals the term (new business like)":
+            (d("EffectiveDate") == d("TermEffectiveDate")) & (d("ExpirationDate") == d("TermExpirationDate")),
+        "effective date after term start (mid-term change like)": d("EffectiveDate") > d("TermEffectiveDate"),
+        "expiration before term end (cancellation like)": d("ExpirationDate") < d("TermExpirationDate"),
+    }
+    extra = [c for c in ("FullTermAmount", "CurrentTermAmount") if c in premium_rows.columns]
+    keys = ["PolicyNumber", "PolicyVersion", "ReferencePolicyVersion", "BookDate", "EffectiveDate", "ExpirationDate",
+            "TermEffectiveDate", "TermExpirationDate", "ProrataPercent"] + extra
+    for label, condition in kinds.items():
+        policies = [r["PolicyNumber"] for r in versions.filter(condition).select("PolicyNumber").distinct().limit(SAMPLES_PER_TYPE).collect()]
+        print("\n--- %s: %s ---" % (label, policies))
+        if policies:
+            show(
+                premium_rows.filter(F.col("PolicyNumber").isin(policies)).groupBy(*keys)
+                .agg(F.sum("OnsetAmount").alias("sum_onset"), F.sum("OffsetAmount").alias("sum_offset"))
+                .orderBy("PolicyNumber", "PolicyVersion"), 40,
+            )
+
+
+# ---- Section 5: earned premium with each candidate date pair ---------------------
+def earned_candidates() -> None:
+    """Calculate earned premium by days with each candidate pair of period dates."""
+    year_start = F.lit("%d-01-01" % YEAR).cast("date")
+    year_end = F.lit("%d-01-01" % (YEAR + 1)).cast("date")
+    for start_column, end_column in [
+        ("EffectiveDate", "TermExpirationDate"), ("EffectiveDate", "ExpirationDate"),
+        ("TermEffectiveDate", "TermExpirationDate"),
+    ]:
+        if start_column not in premium_rows.columns or end_column not in premium_rows.columns:
+            print("%s -> %s: column missing, skipped" % (start_column, end_column))
+            continue
+        start, end = d(start_column), d(end_column)
+        total = F.datediff(end, start)
+        days = F.greatest(F.lit(0), F.datediff(F.least(end, year_end), F.greatest(start, year_start)))
+        invalid = start.isNull() | end.isNull() | (total <= 0)
+        row = premium_rows.agg(
+            F.sum(F.when(written_flag, F.col("premium")).otherwise(0.0)).alias("written"),
+            F.sum(F.when(invalid, F.lit(0.0)).otherwise(F.col("premium") * days / total)).alias("earned"),
+            F.sum(F.when(invalid, 1).otherwise(0)).alias("rows_without_valid_period"),
+        ).collect()[0]
+        written, earned = float(row["written"] or 0.0), float(row["earned"] or 0.0)
+        print("%-18s -> %-18s written=%15.0f earned=%15.0f earned/written=%s rows_without_valid_period=%s" % (
+            start_column, end_column, written, earned, ("%.3f" % (earned / written)) if written else "n/a",
+            row["rows_without_valid_period"]))
+    print("Last year's file had earned/written between 0.62 and 0.85 depending on scope and class.")
+
+
+# ---- Section 6: vehicle class code format and the workbook mapping -----------------
+def class_codes() -> None:
+    """Show the format of the vehicle ClassCode and how the class workbook would map it."""
+    vehicles = (
+        premium_rows.filter(F.col("RiskItemId").isNotNull()).alias("a")
+        .join(
+            ri.filter(F.col("RiskItemType") == "Vehicle").alias("r"),
+            (F.col("a.InTransactionId") == F.col("r.InTransactionId")) & (F.col("a.RiskItemId") == F.col("r.RiskItemId")),
+        )
+        .select(F.trim(F.col("r.ClassCode").cast("string")).alias("raw"), F.col("a.premium").alias("premium"))
+    )
+    print("ClassCode data type in policy_risk_item_info:", dict(ri.dtypes)["ClassCode"])
+    show(vehicles.groupBy(F.length("raw").alias("length")).agg(F.count(F.lit(1)).alias("rows")).orderBy("length"))
+    print("Class codes starting with 0:", vehicles.filter(F.col("raw").startswith("0")).count())
+    show(vehicles.groupBy("raw").agg(F.count(F.lit(1)).alias("rows"), F.sum(F.abs("premium")).alias("abs_premium")).orderBy(F.desc("abs_premium")), 30)
+
+    frames = []
+    for sheet, header, length in CLASS_SHEETS:
+        part = pd.read_excel(CLASS_WORKBOOK_PATH, sheet_name=sheet, header=header, dtype=str)
+        part = part[["Primary Class", "Cost Containment Class"]].dropna()
+        part.columns = ["prefix", "cls"]
+        part["length"] = length
+        frames.append(part)
+    rules = spark.createDataFrame(pd.concat(frames, ignore_index=True))
+    result = vehicles
+    mapped_columns = []
+    for sheet, header, length in CLASS_SHEETS:
+        sheet_rules = rules.filter(F.col("length") == length).select(F.col("prefix").alias("p%d" % length), F.col("cls").alias("c%d" % length))
+        result = (
+            result.withColumn("k%d" % length, F.substring("raw", 1, length))
+            .join(F.broadcast(sheet_rules), F.col("k%d" % length) == F.col("p%d" % length), "left")
+        )
+        mapped_columns.append(F.col("c%d" % length))
+    result = result.withColumn("illinois_class", F.coalesce(*mapped_columns, F.lit("OTHR"))).cache()
+    print("\nWorkbook mapping applied to the vehicle class codes:")
+    show(result.groupBy("illinois_class").agg(F.count(F.lit(1)).alias("rows"), F.sum(F.abs("premium")).alias("abs_premium")).orderBy(F.desc("abs_premium")))
+    print("Largest vehicle class codes that end up as OTHR:")
+    show(result.filter(F.col("illinois_class") == "OTHR").groupBy("raw").agg(F.count(F.lit(1)).alias("rows"), F.sum(F.abs("premium")).alias("abs_premium")).orderBy(F.desc("abs_premium")), 30)
+    taxi = result.filter(F.col("illinois_class") == "3C").agg(F.count(F.lit(1)).alias("rows"), F.sum(F.abs("premium")).alias("abs_premium")).collect()[0]
+    print("Taxi and limo (3C) rows:", taxi["rows"], "| absolute premium:", taxi["abs_premium"])
+
+
+# ---- Section 7: rows with no book date -------------------------------------------------
+def null_book_dates() -> None:
+    """Show the premium rows that have no book date."""
+    nulls = premium_rows.filter(F.col("BookDate").isNull())
+    show(nulls.groupBy("PolicySource").agg(
+        F.count(F.lit(1)).alias("rows"), F.countDistinct("PolicyNumber").alias("policies"), F.sum("premium").alias("premium")))
+    if "TermEffectiveDate" in nulls.columns:
+        show(nulls.groupBy(F.year("TermEffectiveDate").alias("term_year")).agg(
+            F.count(F.lit(1)).alias("rows"), F.sum("premium").alias("premium")).orderBy("term_year"))
+
+
+# ---- Section 8: ASLOB and state ---------------------------------------------------------
+def aslob_and_state() -> None:
+    """Show premium by ASLOB value and by primary risk state for rows written in the year."""
+    booked = premium_rows.filter(written_flag)
+    show(booked.groupBy("ASLOB").agg(F.count(F.lit(1)).alias("rows"), F.sum("premium").alias("premium")).orderBy("ASLOB"))
+    show(booked.groupBy("PrimaryRiskState").agg(F.count(F.lit(1)).alias("rows"), F.sum("premium").alias("premium")).orderBy(F.desc("rows")), 60)
+
+
+# ---- Section 9: claims -------------------------------------------------------------------
+def claims() -> None:
+    """Show claim totals by line, ALAE by company, the December reserve and the claim count shape."""
+    in_year = (F.col("BeginningOfMonth") >= "%d-01-01" % YEAR) & (F.col("BeginningOfMonth") < "%d-01-01" % (YEAR + 1))
+    company = F.col("CompanyCode") == CLAIM_COMPANY_CODE
+    print("Latest BeginningOfMonth in the table:", monthly.agg(F.max("BeginningOfMonth")).collect()[0][0])
+    print("\nPayments and ALAE by EASLobCode, company %s:" % CLAIM_COMPANY_CODE)
+    show(monthly.filter(company & in_year).groupBy("EASLobCode").agg(
+        F.count(F.lit(1)).alias("rows"), F.sum("PaymentAmount").alias("payments"),
+        F.sum("AllocatedLossAdjExp").alias("alae")).orderBy("EASLobCode"))
+    print("ALAE for EASLobCode 194 by company (the ALAE query has no company filter):")
+    show(monthly.filter((F.col("EASLobCode") == "194") & in_year & (F.col("AllocatedLossAdjExp") != 0)).groupBy("CompanyCode").agg(
+        F.count(F.lit(1)).alias("rows"), F.sum("AllocatedLossAdjExp").alias("alae")).orderBy(F.desc("rows")))
+    print("December reserve, company %s, EASLobCode 194:" % CLAIM_COMPANY_CODE)
+    show(monthly.filter(company & (F.col("EASLobCode") == "194") & (F.col("BeginningOfMonth") == "%d-12-01" % YEAR)).agg(
+        F.count(F.lit(1)).alias("rows"), F.sum("NetReserveAmount").alias("net_reserve"),
+        F.sum("ExcessDirectAmount").alias("excess_direct")))
+    paid = monthly.filter(company & in_year & (F.col("EASLobCode") == "194") & (F.col("PaymentAmount") != 0))
+    print("Claim count shape (paid rows in the year):")
+    show(paid.agg(
+        F.countDistinct("ClaimNumber").alias("claims"),
+        F.countDistinct("ClaimNumber", "ClaimantNumber").alias("claim_and_claimant"),
+        F.countDistinct("ClaimNumber", "ClaimantNumber", "ClaimCoverageName", "CoverageExtension").alias("claim_claimant_coverage"),
+        F.sum(F.when(F.col("PaymentAmount") < 0, 1).otherwise(0)).alias("negative_payment_rows"),
+    ))
+
+
+safe("1. COLUMN HINTS (net or gross, ALAE reserve, dividends, installments, state, zip)", columns_hints)
+safe("2. MISSING DATES IN PREMIUM ROWS", date_nulls)
+safe("3. HOW THE DATE COLUMNS RELATE, AND WHAT PRORATAPERCENT MEANS", date_relations)
+safe("4. SAMPLE POLICIES BY TRANSACTION TYPE", sample_policies)
+safe("5. EARNED PREMIUM WITH EACH CANDIDATE DATE PAIR", earned_candidates)
+safe("6. VEHICLE CLASS CODE FORMAT AND THE WORKBOOK MAPPING", class_codes)
+safe("7. PREMIUM ROWS WITH NO BOOK DATE", null_book_dates)
+safe("8. ASLOB AND STATE", aslob_and_state)
+safe("9. CLAIMS", claims)
+print("\nDONE. Copy everything from the first header to this line and send it.")
